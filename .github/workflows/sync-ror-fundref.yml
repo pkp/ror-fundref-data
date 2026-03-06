@@ -1,0 +1,182 @@
+name: Sync ROR Fundref Mappings
+
+on:
+  schedule:
+    # Runs every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    # Also allows manual trigger from the GitHub Actions UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Download, extract and push ROR fundref mappings
+        env:
+          GITHUB_TOKEN: ${{ secrets.ROR_SYNC_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import io
+          import os
+          import re
+          import sys
+          import csv
+          import base64
+          import zipfile
+          import requests
+
+          GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+          DEST_REPO    = "tsv-fi/funderMigration"
+          DEST_PATH    = "data/ror_fundref.csv"
+          DEST_BRANCH  = "main"
+
+          SOURCE_REPO  = "ror-community/ror-data"
+
+          HEADERS = {
+              "Authorization": f"token {GITHUB_TOKEN}",
+              "Accept": "application/vnd.github+json",
+          }
+
+          def log(msg):
+              print(f"[ror-sync] {msg}", flush=True)
+
+          # ── 1. Find latest zip ────────────────────────────────────────────────
+
+          def latest_from_github():
+              log("Checking GitHub for latest ROR release …")
+              url = f"https://api.github.com/repos/{SOURCE_REPO}/contents/"
+              r = requests.get(url, headers=HEADERS, timeout=30)
+              if r.status_code != 200:
+                  log(f"GitHub API returned {r.status_code}")
+                  return None, None
+              def vkey(f):
+                  m = re.match(r"v(\d+)\.(\d+)(?:\.(\d+))?", f["name"])
+                  return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else (0,0,0)
+              zips = [f for f in r.json() if f["name"].endswith(".zip") and re.match(r"v\d+\.\d+", f["name"])]
+              if not zips:
+                  return None, None
+              latest = max(zips, key=vkey)
+              log(f"Latest GitHub release: {latest['name']}")
+              return latest["name"], latest["download_url"]
+
+          def latest_from_zenodo():
+              log("Falling back to Zenodo …")
+              r = requests.get(
+                  "https://zenodo.org/api/records",
+                  params={"communities": "ror-data", "sort": "mostrecent", "size": 1},
+                  timeout=30,
+              )
+              if r.status_code != 200:
+                  return None, None
+              hits = r.json().get("hits", {}).get("hits", [])
+              if not hits:
+                  return None, None
+              files = [f for f in hits[0].get("files", []) if f["key"].endswith(".zip")]
+              if not files:
+                  return None, None
+              f = files[0]
+              log(f"Latest Zenodo release: {f['key']}")
+              return f["key"], f["links"]["self"]
+
+          zip_name, zip_url = latest_from_github()
+          if not zip_url:
+              zip_name, zip_url = latest_from_zenodo()
+          if not zip_url:
+              sys.exit("ERROR: Could not locate ROR release from GitHub or Zenodo.")
+
+          # ── 2. Download zip ───────────────────────────────────────────────────
+
+          log(f"Downloading {zip_name} …")
+          r = requests.get(zip_url, stream=True, timeout=180)
+          if r.status_code != 200:
+              sys.exit(f"ERROR: Download failed with status {r.status_code}")
+
+          # ── 3. Extract CSV from zip ───────────────────────────────────────────
+
+          log("Extracting CSV from zip …")
+          with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+              csv_files = [n for n in zf.namelist() if n.endswith(".csv") and "schema" not in n]
+              if not csv_files:
+                  sys.exit("ERROR: No CSV file found in the zip.")
+              csv_name = csv_files[0]
+              log(f"Using CSV: {csv_name}")
+              csv_bytes = zf.read(csv_name)
+
+          # ── 4. Filter id + fundref, one row per fundref ID ────────────────────
+
+          log("Filtering id and fundref columns …")
+          output = io.StringIO()
+          writer = csv.writer(output)
+          writer.writerow(["ror_id", "fundref_id"])
+
+          reader = csv.DictReader(io.StringIO(csv_bytes.decode("utf-8")))
+          rows_written = 0
+          rows_skipped = 0
+
+          for row in reader:
+              ror_id  = row.get("id", "").strip()
+              fundref = row.get("external_ids.type.fundref.all", "").strip()
+              if not ror_id or not fundref:
+                  rows_skipped += 1
+                  continue
+              for fid in fundref.split(";"):
+                  fid = fid.strip()
+                  if fid:
+                      writer.writerow([ror_id, fid])
+                      rows_written += 1
+
+          log(f"{rows_written} rows written, {rows_skipped} rows skipped.")
+
+          # ── 5. Push to destination repo ───────────────────────────────────────
+
+          version = re.match(r"(v[\d.]+)", zip_name)
+          version_str = version.group(1) if version else zip_name
+
+          encoded = base64.b64encode(output.getvalue().encode("utf-8")).decode("utf-8")
+
+          # Get existing file SHA if it exists (needed for update)
+          sha = None
+          check = requests.get(
+              f"https://api.github.com/repos/{DEST_REPO}/contents/{DEST_PATH}",
+              headers=HEADERS,
+              params={"ref": DEST_BRANCH},
+              timeout=15,
+          )
+          if check.status_code == 200:
+              sha = check.json().get("sha")
+              log(f"Updating existing file (SHA: {sha[:7]}) …")
+          else:
+              log("Creating new file …")
+
+          payload = {
+              "message": f"chore: update ROR fundref mappings to {version_str}",
+              "content": encoded,
+              "branch": DEST_BRANCH,
+          }
+          if sha:
+              payload["sha"] = sha
+
+          resp = requests.put(
+              f"https://api.github.com/repos/{DEST_REPO}/contents/{DEST_PATH}",
+              headers=HEADERS,
+              json=payload,
+              timeout=60,
+          )
+
+          if resp.status_code in (200, 201):
+              log(f"Success! Commit: {resp.json()['commit']['html_url']}")
+          else:
+              sys.exit(f"ERROR: Push failed {resp.status_code} — {resp.text}")
+          EOF
