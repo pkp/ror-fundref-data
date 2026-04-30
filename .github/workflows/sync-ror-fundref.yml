@@ -7,27 +7,26 @@ on:
   workflow_dispatch:
     # Also allows manual trigger from the GitHub Actions UI
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
 
+    concurrency:
+      group: ror-sync
+      cancel-in-progress: true
+
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install dependencies
         run: pip install requests
 
       - name: Download, extract and push ROR fundref mappings
         env:
-          GITHUB_TOKEN: ${{ secrets.ROR_SYNC_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python - <<'EOF'
+          python3 - <<'EOF'
           import io
           import os
           import re
@@ -38,7 +37,7 @@ jobs:
           import requests
 
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-          DEST_REPO    = "tsv-fi/funderMigration"
+          DEST_REPO    = "pkp/ror-fundref-data"
           DEST_PATH    = "data/ror_fundref.csv"
           DEST_BRANCH  = "main"
 
@@ -55,7 +54,7 @@ jobs:
           # ── 1. Find latest zip ────────────────────────────────────────────────
 
           def latest_from_github():
-              log("Checking GitHub for latest ROR release …")
+              log("Falling back to GitHub for latest ROR release …")
               url = f"https://api.github.com/repos/{SOURCE_REPO}/contents/"
               r = requests.get(url, headers=HEADERS, timeout=30)
               if r.status_code != 200:
@@ -72,47 +71,49 @@ jobs:
               return latest["name"], latest["download_url"]
 
           def latest_from_zenodo():
-              log("Falling back to Zenodo …")
-              r = requests.get(
-                  "https://zenodo.org/api/records",
-                  params={"communities": "ror-data", "sort": "mostrecent", "size": 1},
-                  timeout=30,
-              )
+              log("Checking Zenodo for latest ROR release …")
+              r = requests.get("https://zenodo.org/api/records/6347574", timeout=30)
               if r.status_code != 200:
+                  log(f"Zenodo API returned {r.status_code}")
                   return None, None
-              hits = r.json().get("hits", {}).get("hits", [])
-              if not hits:
-                  return None, None
-              files = [f for f in hits[0].get("files", []) if f["key"].endswith(".zip")]
+              files = [f for f in r.json().get("files", []) if f["key"].endswith(".zip")]
               if not files:
                   return None, None
               f = files[0]
               log(f"Latest Zenodo release: {f['key']}")
               return f["key"], f["links"]["self"]
 
-          zip_name, zip_url = latest_from_github()
+          zip_name, zip_url = latest_from_zenodo()
           if not zip_url:
-              zip_name, zip_url = latest_from_zenodo()
+              zip_name, zip_url = latest_from_github()
           if not zip_url:
-              sys.exit("ERROR: Could not locate ROR release from GitHub or Zenodo.")
+              sys.exit("ERROR: Could not locate ROR release from Zenodo or GitHub.")
 
           # ── 2. Download zip ───────────────────────────────────────────────────
 
           log(f"Downloading {zip_name} …")
-          r = requests.get(zip_url, stream=True, timeout=180)
+          r = requests.get(zip_url, timeout=600)
           if r.status_code != 200:
               sys.exit(f"ERROR: Download failed with status {r.status_code}")
 
           # ── 3. Extract CSV from zip ───────────────────────────────────────────
 
+          FUNDREF_COL = "external_ids.type.fundref.all"
+
           log("Extracting CSV from zip …")
           with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-              csv_files = [n for n in zf.namelist() if n.endswith(".csv") and "schema" not in n]
-              if not csv_files:
+              candidates = [n for n in zf.namelist() if n.endswith(".csv")]
+              if not candidates:
                   sys.exit("ERROR: No CSV file found in the zip.")
-              csv_name = csv_files[0]
+              csv_name, csv_bytes = None, None
+              for candidate in candidates:
+                  raw = zf.read(candidate)
+                  if FUNDREF_COL.encode() in raw.split(b"\n", 1)[0]:
+                      csv_name, csv_bytes = candidate, raw
+                      break
+              if csv_bytes is None:
+                  sys.exit(f"ERROR: No CSV with column '{FUNDREF_COL}' found in the zip.")
               log(f"Using CSV: {csv_name}")
-              csv_bytes = zf.read(csv_name)
 
           # ── 4. Filter id + fundref, one row per fundref ID ────────────────────
 
@@ -127,7 +128,7 @@ jobs:
 
           for row in reader:
               ror_id  = row.get("id", "").strip()
-              fundref = row.get("external_ids.type.fundref.all", "").strip()
+              fundref = row.get(FUNDREF_COL, "").strip()
               if not ror_id or not fundref:
                   rows_skipped += 1
                   continue
@@ -138,11 +139,26 @@ jobs:
                       rows_written += 1
 
           log(f"{rows_written} rows written, {rows_skipped} rows skipped.")
+          if rows_written == 0:
+              sys.exit("ERROR: No rows written — aborting push to avoid overwriting data with empty file.")
 
           # ── 5. Push to destination repo ───────────────────────────────────────
 
           version = re.match(r"(v[\d.]+)", zip_name)
           version_str = version.group(1) if version else zip_name
+
+          # Skip push if the destination is already at this version
+          commit_resp = requests.get(
+              f"https://api.github.com/repos/{DEST_REPO}/commits",
+              headers=HEADERS,
+              params={"path": DEST_PATH, "sha": DEST_BRANCH, "per_page": 1},
+              timeout=15,
+          )
+          if commit_resp.status_code == 200:
+              commits = commit_resp.json()
+              if commits and commits[0].get("commit", {}).get("message", "").endswith(version_str):
+                  log(f"Already up to date ({version_str}), nothing to push.")
+                  sys.exit(0)
 
           encoded = base64.b64encode(output.getvalue().encode("utf-8")).decode("utf-8")
 
