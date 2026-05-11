@@ -72,7 +72,11 @@ jobs:
 
           def latest_from_zenodo():
               log("Checking Zenodo for latest ROR release …")
-              r = requests.get("https://zenodo.org/api/records/6347574", timeout=30)
+              try:
+                  r = requests.get("https://zenodo.org/api/records/6347574", timeout=60)
+              except requests.exceptions.RequestException as e:
+                  log(f"Zenodo request failed: {e}")
+                  return None, None
               if r.status_code != 200:
                   log(f"Zenodo API returned {r.status_code}")
                   return None, None
